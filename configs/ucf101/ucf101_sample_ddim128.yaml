@@ -1,6 +1,6 @@
 # path:
 ckpt:
-save_img_path: "./sample_videos/"
+save_img_path: "./sample_videos_64/"
 pretrained_model_path: "maxin-cn/Latte"
 
 # model config: 
@@ -21,7 +21,7 @@ use_fp16: True
 # sample config:
 seed:
 sample_method: 'ddim'
-num_sampling_steps: 64
+num_sampling_steps: 128
 cfg_scale: 7.0
 run_time: 12
 num_sample: 1
@@ -29,5 +29,5 @@ sample_names: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 negative_name: 101
 
 # ddp sample config
-per_proc_batch_size: 32
+per_proc_batch_size: 8
 num_fvd_samples: 2048

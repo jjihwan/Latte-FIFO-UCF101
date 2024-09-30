@@ -28,6 +28,9 @@ except:
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
+def modulate_fifo(x, shift, scale):
+    return x * (1 + scale) + shift
+
 #################################################################################
 #               Attention Layers from TIMM                                      #
 #################################################################################
@@ -175,9 +178,15 @@ class TransformerBlock(nn.Module):
         )
 
     def forward(self, x, c):
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        is_fifo_temp = len(c.shape) == 3
+        if is_fifo_temp:
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=2)
+            x = x + gate_msa * self.attn(modulate_fifo(self.norm1(x), shift_msa, scale_msa))
+            x = x + gate_mlp * self.mlp(modulate_fifo(self.norm2(x), shift_mlp, scale_mlp))
+        else:
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
+            x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+            x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
 
@@ -323,20 +332,31 @@ class Latte(nn.Module):
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
         """
+        is_fifo= x.shape[1] != t.shape[0]
+        b, f, c, h, w = x.shape
+
         if use_fp16:
             x = x.to(dtype=torch.float16)
 
         batches, frames, channels, high, weight = x.shape 
         x = rearrange(x, 'b f c h w -> (b f) c h w')
         x = self.x_embedder(x) + self.pos_embed  
-        t = self.t_embedder(t, use_fp16=use_fp16)                  
-        timestep_spatial = repeat(t, 'n d -> (n c) d', c=self.temp_embed.shape[1]) 
-        timestep_temp = repeat(t, 'n d -> (n c) d', c=self.pos_embed.shape[1])
+        t = self.t_embedder(t, use_fp16=use_fp16)
+        if is_fifo:
+            t = rearrange(t, '(b f) d -> b f d', b=b)
+            timestep_spatial = rearrange(t, 'b f d -> (b f) d')
+            timestep_temp = repeat(t, 'b f d -> (b c) f d', c=self.pos_embed.shape[1])
+        else:
+            timestep_spatial = repeat(t, 'n d -> (n c) d', c=self.temp_embed.shape[1]) 
+            timestep_temp = repeat(t, 'n d -> (n c) d', c=self.pos_embed.shape[1])
 
         if self.extras == 2:
             y = self.y_embedder(y, self.training)
             y_spatial = repeat(y, 'n d -> (n c) d', c=self.temp_embed.shape[1]) 
             y_temp = repeat(y, 'n d -> (n c) d', c=self.pos_embed.shape[1])
+            if is_fifo:
+                y_temp = y_temp.unsqueeze(1)
+
         elif self.extras == 78:
             text_embedding = self.text_embedding_projection(text_embedding.reshape(batches, -1))
             text_embedding_spatial = repeat(text_embedding, 'n d -> (n c) d', c=self.temp_embed.shape[1])
@@ -367,12 +387,15 @@ class Latte(nn.Module):
             x = temp_block(x, c)
             x = rearrange(x, '(b t) f d -> (b f) t d', b=batches)
 
+
         if self.extras == 2:
             c = timestep_spatial + y_spatial
         else:
             c = timestep_spatial
-        x = self.final_layer(x, c)               
-        x = self.unpatchify(x)                  
+        x = self.final_layer(x, c)      
+   
+        x = self.unpatchify(x)      
+
         x = rearrange(x, '(b f) c h w -> b f c h w', b=batches)
         return x
 

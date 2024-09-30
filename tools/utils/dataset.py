@@ -275,7 +275,7 @@ class VideoFramesFolderDataset(Dataset):
         self.load_n_consecutive = load_n_consecutive
         self.load_n_consecutive_random_offset = load_n_consecutive_random_offset
         self.subsample_factor = subsample_factor
-        print(subsample_factor)
+        print(path, subsample_factor)
         self.discard_short_videos = discard_short_videos
 
         if self.subsample_factor > 1 and self.load_n_consecutive is None:

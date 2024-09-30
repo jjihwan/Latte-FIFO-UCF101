@@ -125,6 +125,12 @@ def fvd2048_128f(opts):
     return dict(fvd2048_128f=fvd)
 
 @register_metric
+def fvd512_128f(opts):
+    opts.dataset_kwargs.update(max_size=None, xflip=False)
+    fvd = frechet_video_distance.compute_fvd(opts, max_real=512, num_gen=512, num_frames=128)
+    return dict(fvd512_128f=fvd)
+
+@register_metric
 def fvd2048_128f_subsample8f(opts):
     """Similar to `fvd2048_128f`, but we sample each 8-th frame"""
     opts.dataset_kwargs.update(max_size=None, xflip=False)

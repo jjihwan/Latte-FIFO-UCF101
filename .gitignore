@@ -1,2 +1,12 @@
 .vscode
 preprocess
+
+.latte
+__pycache__
+*.pyc
+test_*
+
+.latte-vessl
+
+*.pt
+share_ckpts/

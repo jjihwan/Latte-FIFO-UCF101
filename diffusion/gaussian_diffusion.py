@@ -9,6 +9,8 @@ import math
 import numpy as np
 import torch as th
 import enum
+from tqdm import trange
+import einops
 
 from .diffusion_utils import discretized_gaussian_log_likelihood, normal_kl
 
@@ -250,7 +252,6 @@ class GaussianDiffusion:
             == x_start.shape[0]
         )
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
-
     def p_mean_variance(self, model, x, t, clip_denoised=True, denoised_fn=None, model_kwargs=None):
         """
         Apply the model to get p(x_{t-1} | x_t), as well as a prediction of
@@ -333,6 +334,94 @@ class GaussianDiffusion:
             "log_variance": model_log_variance,
             "pred_xstart": pred_xstart,
             "extra": extra,
+        }
+    
+
+    def p_mean_variance_fifo(self, model, X, idx, clip_denoised=True, denoised_fn=None, model_kwargs=None):
+        """
+        Apply the model to get p(x_{t-1} | x_t), as well as a prediction of
+        the initial x, x_0.
+        :param model: the model, which takes a signal and a batch of timesteps
+                      as input.
+        :param x: the [N x C x ...] tensor at time t.
+        :param t: a 1-D Tensor of timesteps.
+        :param clip_denoised: if True, clip the denoised signal into [-1, 1].
+        :param denoised_fn: if not None, a function which applies to the
+            x_start prediction before it is used to sample. Applies before
+            clip_denoised.
+        :param model_kwargs: if not None, a dict of extra keyword arguments to
+            pass to the model. This can be used for conditioning.
+        :return: a dict with the following keys:
+                 - 'mean': the model mean output.
+                 - 'variance': the model variance output.
+                 - 'log_variance': the log of 'variance'.
+                 - 'pred_xstart': the prediction for x_0.
+        """
+        if model_kwargs is None:
+            model_kwargs = {}
+
+        B, F, C = X.shape[:3]
+
+        assert idx.shape == (B, F)
+
+        idx = einops.rearrange(idx, "b f -> (b f)")
+        model_output = model(X, idx, **model_kwargs)
+        idx = einops.rearrange(idx, "(b f) -> b f", b=B)
+
+        if isinstance(model_output, tuple):
+            model_output, extra = model_output
+        else:
+            extra = None
+
+        assert model_output.shape == (B, F, C * 2, *X.shape[3:])
+        model_output, model_var_values = th.split(model_output, C, dim=2)
+
+        model_means = []
+        model_variances = []
+        model_log_variances = []
+        pred_xstarts = []
+
+        for i in range(F):
+            t = idx[:, i]
+            x = X[:, [i]]
+            min_log = _extract_into_tensor(self.posterior_log_variance_clipped, t, x.shape)
+            max_log = _extract_into_tensor(np.log(self.betas), t, x.shape)
+            # The model_var_values is [-1, 1] for [min_var, max_var].
+            frac = (model_var_values[:,[i]] + 1) / 2
+            model_log_variance = frac * max_log + (1 - frac) * min_log
+            model_variance = th.exp(model_log_variance)
+
+            def process_xstart(x):
+                if denoised_fn is not None:
+                    x = denoised_fn(x)
+                if clip_denoised:
+                    return x.clamp(-1, 1)
+                return x
+
+
+            pred_xstart = process_xstart(
+                self._predict_xstart_from_eps(x_t=x, t=t, eps=model_output[:,[i]])
+            )
+            model_mean, _, _ = self.q_posterior_mean_variance(x_start=pred_xstart, x_t=x, t=t)
+
+            assert model_mean.shape == model_log_variance.shape == pred_xstart.shape == x.shape
+
+            model_means.append(model_mean)
+            model_variances.append(model_variance)
+            model_log_variances.append(model_log_variance)
+            pred_xstarts.append(pred_xstart)
+
+        model_mean = th.cat(model_means, dim=1)
+        model_variance = th.cat(model_variances, dim=1)
+        model_log_variance = th.cat(model_log_variances, dim=1)
+        pred_xstart = th.cat(pred_xstarts, dim=1)
+
+
+        return {
+            "mean": model_mean,
+            "variance": model_variance,
+            "log_variance": model_log_variance,
+            "pred_xstart": pred_xstart,
         }
 
     def _predict_xstart_from_eps(self, x_t, t, eps):
@@ -563,6 +652,62 @@ class GaussianDiffusion:
         sample = mean_pred + nonzero_mask * sigma * noise
         return {"sample": sample, "pred_xstart": out["pred_xstart"]}
 
+    def ddim_sample_fifo(
+        self,
+        model,
+        x,
+        t,
+        clip_denoised=True,
+        denoised_fn=None,
+        cond_fn=None,
+        model_kwargs=None,
+        eta=0.0,
+    ):
+        """
+        Sample x_{t-1} from the model using DDIM.
+        Same usage as p_sample().
+        """
+        out = self.p_mean_variance_fifo(
+            model,
+            x,
+            t,
+            clip_denoised=clip_denoised,
+            denoised_fn=denoised_fn,
+            model_kwargs=model_kwargs,
+        )
+
+        samples = []
+
+        for i in range(t.shape[1]):
+            tt = t[:, [i]]
+            xx = x[:, [i]]
+
+            eps = self._predict_eps_from_xstart(xx, tt, out["pred_xstart"][:, [i]])
+
+            alpha_bar = _extract_into_tensor(self.alphas_cumprod, tt, xx.shape)
+            alpha_bar_prev = _extract_into_tensor(self.alphas_cumprod_prev, tt, xx.shape)
+            sigma = (
+                eta
+                * th.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar))
+                * th.sqrt(1 - alpha_bar / alpha_bar_prev)
+            )
+            # Equation 12.
+            noise = th.randn_like(xx)
+            mean_pred = (
+                out["pred_xstart"][:, [i]] * th.sqrt(alpha_bar_prev)
+                + th.sqrt(1 - alpha_bar_prev - sigma ** 2) * eps
+            )
+            nonzero_mask = (
+                (tt != 0).float().view(-1, *([1] * (len(xx.shape) - 1)))
+            )
+            sample = mean_pred + nonzero_mask * sigma * noise
+
+            samples.append(sample)
+        
+        sample = th.cat(samples, dim=1)
+
+        return {"sample": sample, "pred_xstart": out["pred_xstart"]}
+
     def ddim_reverse_sample(
         self,
         model,
@@ -682,6 +827,136 @@ class GaussianDiffusion:
                 )
                 yield out
                 img = out["sample"]
+    
+    def ddim_sample_loop_fifo(
+        self,
+        model,
+        shape,
+        noise=None,
+        clip_denoised=True,
+        denoised_fn=None,
+        cond_fn=None,
+        model_kwargs=None,
+        device=None,
+        progress=False,
+        eta=0.0,
+        args=None,
+    ):
+        """
+        Generate samples from the model using DDIM.
+        Same usage as p_sample_loop().
+        """
+        final = None
+
+        final = self.ddim_sample_loop_progressive_fifo(
+            model,
+            shape,
+            noise=noise,
+            clip_denoised=clip_denoised,
+            denoised_fn=denoised_fn,
+            cond_fn=cond_fn,
+            model_kwargs=model_kwargs,
+            device=device,
+            progress=progress,
+            eta=eta,
+            args=args,
+        )
+
+        return final
+
+
+    def ddim_sample_loop_progressive_fifo(
+        self,
+        model,
+        shape,
+        noise=None,
+        clip_denoised=True,
+        denoised_fn=None,
+        cond_fn=None,
+        model_kwargs=None,
+        device=None,
+        progress=False,
+        eta=0.0,
+        args=None
+    ):
+        """
+        Use DDIM to sample from the model and yield intermediate samples from
+        each timestep of DDIM.
+        Same usage as p_sample_loop_progressive().
+        """
+
+        b, f, c, h, w = shape
+        using_cfg = args.cfg_scale > 1.0 # True
+
+        if device is None:
+            device = next(model.parameters()).device
+        assert isinstance(shape, (tuple, list))
+        if noise is not None:
+            img = noise
+        else:
+            img = th.randn(*shape, device=device)
+
+        indices = list(range(self.num_timesteps))
+
+        if args.lookahead_denoising:
+            indices = np.concatenate([np.full((f//2,), 0), indices])
+        
+
+        max_queue_length = len(indices)
+        
+        if noise is None:
+            init_noise_shape = [b, max_queue_length, c, h, w]
+            z = th.randn(init_noise_shape).to(device)
+        else:
+            z = noise
+
+        if using_cfg:
+            z = th.cat([z,z], 0) # [2b, max_queue_length, c, h, w]
+
+        indices = th.tensor(indices, device=device)
+        indices = einops.repeat(indices, 't -> b t', b=z.shape[0])
+
+        output_latents = []
+
+        for i in trange(args.new_video_length+args.num_sampling_steps+f//2 if args.lookahead_denoising else args.new_video_length+args.num_sampling_steps, desc='FIFO Sampling'):
+            curr_indices = indices.clone()
+            if i < max_queue_length-1:
+                curr_indices[:,:-i-1] = curr_indices[:,[-i-1]]
+
+            for rank in reversed(range(2*args.num_partitions if args.lookahead_denoising else args.num_partitions)):
+                start_idx = rank*(f // 2) if args.lookahead_denoising else rank*f
+                midpoint_idx = start_idx + f // 2
+                end_idx = start_idx + f
+
+                input_idx = curr_indices[:,start_idx:end_idx]
+                input_z = z[:,start_idx:end_idx].clone()
+                with th.no_grad():
+                    ddim_output = self.ddim_sample_fifo(
+                        model,
+                        input_z, # [2b, f, c, h, w]
+                        input_idx, # [2b, f]
+                        clip_denoised=clip_denoised, # False
+                        denoised_fn=denoised_fn, # None
+                        cond_fn=cond_fn, # None
+                        model_kwargs=model_kwargs,
+                        eta=eta,
+                    )
+                    
+                    if args.lookahead_denoising:
+                        z[:,midpoint_idx:end_idx] = ddim_output["sample"][:,-f//2:]
+                    else:
+                        z[:,start_idx:end_idx] = ddim_output["sample"]
+                    del ddim_output
+                
+            if i >= max_queue_length:
+                first_frame_idx = f//2 if args.lookahead_denoising else 0
+                output_latents.append(z[:,[first_frame_idx]].clone())
+            
+            z = shift_latents(z)
+        
+        output_latents = th.cat(output_latents, 1)
+        return output_latents
+    
 
     def _vb_terms_bpd(
             self, model, x_start, x_t, t, clip_denoised=True, model_kwargs=None
@@ -864,6 +1139,13 @@ class GaussianDiffusion:
             "xstart_mse": xstart_mse,
             "mse": mse,
         }
+
+def shift_latents(latents):
+    # dequeue & enqueue
+    latents[:,:-1] = latents[:,1:].clone()
+    latents[:,-1] = th.randn_like(latents[:,-1])
+    
+    return latents
 
 
 def _extract_into_tensor(arr, timesteps, broadcast_shape):

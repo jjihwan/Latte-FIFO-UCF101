@@ -65,6 +65,10 @@ def main(args):
         torch.manual_seed(seed)
     torch.cuda.set_device(device)
     # print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
+    
+    args.new_video_length=128
+    args.num_sampling_steps = args.num_partitions * args.num_frames
+
 
     if args.ckpt is None:
         assert args.model == "Latte-XL/2", "Only Latte-XL/2 models are available for auto-download."
@@ -72,8 +76,8 @@ def main(args):
         assert args.num_classes == 1000
 
     # Load model:
-    latent_size = args.image_size // 8
-    args.latent_size = latent_size
+    latent_size = args.image_size // 8 # 32
+    args.latent_size = latent_size # 32
     model = get_models(args).to(device)
 
     if args.use_compile:
@@ -127,18 +131,22 @@ def main(args):
     pbar = tqdm(pbar) if rank == 0 else pbar
     total = 0
     for _ in pbar:
+        z_shape = (n, args.num_frames, 4, latent_size, latent_size)
+        z = torch.randn(z_shape, device=device)
         # Sample inputs:
-        if args.use_fp16:
-            z = torch.randn(n, args.num_frames, 4, latent_size, latent_size, dtype=torch.float16, device=device)
-        else:
-            z = torch.randn(n, args.num_frames, 4, latent_size, latent_size, device=device)
+        # if args.use_fp16:
+        #     z = torch.randn(n, args.num_frames, 4, latent_size, latent_size, dtype=torch.float16, device=device)
+        # else:
+        #     z = torch.randn(n, args.num_frames, 4, latent_size, latent_size, device=device)
+
+        # z : [B, F, C, H, W]
         
         # Setup classifier-free guidance:
         if using_cfg:
-            z = torch.cat([z, z], 0)
-            y = torch.randint(0, args.num_classes, (n,), device=device)
-            y_null = torch.tensor([101] * n, device=device)
-            y = torch.cat([y, y_null], dim=0)
+            # z = torch.cat([z, z], 0) # [2B, F, C, H, W]
+            y = torch.randint(0, args.num_classes, (n,), device=device) # [B]
+            y_null = torch.tensor([101] * n, device=device) # [B]
+            y = torch.cat([y, y_null], dim=0) # [2B]
             model_kwargs = dict(y=y, cfg_scale=args.cfg_scale, use_fp16=args.use_fp16)
             sample_fn = model.forward_with_cfg
         else:
@@ -146,13 +154,19 @@ def main(args):
             sample_fn = model.forward
 
         # Sample images:
-        if args.sample_method == 'ddim':
+        if args.sample_method == 'ddim_fifo':
+            samples = diffusion.ddim_sample_loop_fifo(
+                sample_fn, z_shape, clip_denoised=False, model_kwargs=model_kwargs, progress=False, device=device, eta=args.ddim_eta, args=args
+            ) # ToDo remove z
+        elif args.sample_method == 'ddim':
+            z = torch.cat([z, z], 0) # [2B, F, C, H, W]
+            z_shape = z.shape
             samples = diffusion.ddim_sample_loop(
-                sample_fn, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=False, device=device, eta=args.ddim_eta, 
+                sample_fn, z_shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=False, eta=args.ddim_eta, device=device
             )
         elif args.sample_method == 'ddpm':
             samples = diffusion.p_sample_loop(
-                sample_fn, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=False, device=device, eta=args.ddim_eta, 
+                sample_fn, z_shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=False, eta=args.ddim_eta, device=device
             )
 
 
@@ -163,9 +177,17 @@ def main(args):
             samples = samples.to(dtype=torch.float16)
 
         b, f, c, h, w = samples.shape
-        samples = rearrange(samples, 'b f c h w -> (b f) c h w')
-        samples = vae.decode(samples / 0.18215).sample
-        samples = rearrange(samples, '(b f) c h w -> b f c h w', b=b)
+
+        sample_list = []
+        for i in range(b):
+            sample = samples[i]
+            sample = vae.decode(sample / 0.18215).sample
+            sample_list.append(sample)
+        samples = torch.stack(sample_list, dim=0)
+
+        # samples = rearrange(samples, 'b f c h w -> (b f) c h w')
+        # samples = vae.decode(samples / 0.18215).sample
+        # samples = rearrange(samples, '(b f) c h w -> b f c h w', b=b)
 
         # Save samples to disk as individual .png files
         for i, sample in enumerate(samples):
@@ -192,10 +214,14 @@ if __name__ == "__main__":
     parser.add_argument("--save_video_path", type=str, default="./sample_videos/")
     parser.add_argument("--save_ceph", default=False, action='store_true')
     parser.add_argument("--ddim_eta", type=float, default=0.0)
+    parser.add_argument("--num_partitions", type=int, default=4)
+    parser.add_argument("--lookahead_denoising", default=False, action='store_true')
     args = parser.parse_args()
     omega_conf = OmegaConf.load(args.config)
     omega_conf.ckpt = args.ckpt
     omega_conf.save_video_path = args.save_video_path
     omega_conf.save_ceph = args.save_ceph
     omega_conf.ddim_eta = args.ddim_eta
+    omega_conf.num_partitions = args.num_partitions
+    omega_conf.lookahead_denoising = args.lookahead_denoising
     main(omega_conf)
